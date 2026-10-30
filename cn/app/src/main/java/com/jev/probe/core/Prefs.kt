@@ -224,9 +224,9 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         sp.edit().putInt(K_CARD_X + pkg, x).putInt(K_CARD_Y + pkg, y).apply()
     }
 
-    /** Auto-analyze on every incoming message; if false, user taps to analyze. */
+    /** Auto-analyze on every incoming message; off by default, the ball is the trigger. */
     var autoAnalyze: Boolean
-        get() = sp.getBoolean(K_AUTO, true)
+        get() = sp.getBoolean(K_AUTO, false)
         set(v) = sp.edit().putBoolean(K_AUTO, v).apply()
 
     // ------------------------------------------------------------- helpers

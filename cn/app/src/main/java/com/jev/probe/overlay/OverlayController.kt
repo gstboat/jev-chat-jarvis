@@ -29,19 +29,19 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Floating overlay with two forms.
+ * Floating overlay with three forms.
  *
- * - **Card** (inside an adapted chat): a small card that stays where the user put
- *   it. Collapsed it shows the risk level and the other person's intent; tapping
- *   the header expands it to the full read plus the candidate replies (copy /
- *   fill — never send) and a "换一组" button; tapping again collapses it. The
- *   header drags the card anywhere; the spot is remembered per app. New results
- *   replace the old ones in place — the card never pops open on its own and is
- *   never left blank while a round runs.
- * - **Bubble** (outside a chat window, or in an app without an adapter): the
- *   small "Jev" ball; tapping or long-pressing it opens the menu (截屏识别一次…).
+ * - **Ball** (inside an adapted chat): a 48dp round button, draggable, showing
+ *   only the risk level once a round has landed. Tapping it starts a manual
+ *   analysis (or reopens the panel when a result is already there). Nothing is
+ *   analyzed until the user taps — auto-analysis is opt-in in Settings.
+ * - **Card**: the result panel. It opens by itself when a tapped round lands,
+ *   shows the read plus the candidate replies (copy only — never fill, never
+ *   send) and a "换一组" button; tapping the header folds it back into the ball.
+ * - **Bubble** (outside a chat window): the small "Jev" ball; tapping or
+ *   long-pressing it opens the menu (截屏识别一次…).
  *
- * Long-pressing the card header opens the same menu.
+ * Long-pressing card header or ball opens the same menu.
  */
 class OverlayController(private val ctx: Context) {
 
@@ -49,11 +49,14 @@ class OverlayController(private val ctx: Context) {
     private val prefs = Prefs(ctx)
     private val main = Handler(Looper.getMainLooper())
 
-    private enum class Mode { BUBBLE, CARD }
+    private enum class Mode { BUBBLE, BALL, CARD }
 
     private var root: FrameLayout? = null
     private var lp: WindowManager.LayoutParams? = null
     private var mode: Mode? = null
+
+    // Ball view (null while the ball is not built).
+    private var ballView: TextView? = null
 
     // Card views (null while the card is not built).
     private var cardView: LinearLayout? = null
@@ -65,6 +68,9 @@ class OverlayController(private val ctx: Context) {
     private var body: LinearLayout? = null
     private var menuView: View? = null
     private var expanded = false
+
+    /** A tapped round should open the panel as soon as its judgment lands. */
+    private var autoExpand = false
 
     /** Header tap with nothing to show yet (or after an error): analyze the open chat. */
     var onManualAnalyze: (() -> Unit)? = null
@@ -87,7 +93,6 @@ class OverlayController(private val ctx: Context) {
     private var judgeWaiting = false
     private var repliesWaiting = false
     private var waitStart = 0L
-    private var lastFill: ((String) -> Unit)? = null
     private var ctxNotes = 0
     private var ctxHistory = 0
     private var noteText: String? = null
@@ -105,7 +110,7 @@ class OverlayController(private val ctx: Context) {
 
     private val screenW get() = ctx.resources.displayMetrics.widthPixels
     private val screenH get() = ctx.resources.displayMetrics.heightPixels
-    private val cardW get() = minOf(screenW - dp(16), dp(380))
+    private val cardW get() = minOf(screenW - dp(16), dp(300))
 
     /** Card background: white with the user's opacity so the chat shows through. */
     private fun panelBg(): Int {
@@ -144,7 +149,7 @@ class OverlayController(private val ctx: Context) {
 
     private fun updateLayout() { root?.let { r -> lp?.let { runCatching { wm.updateViewLayout(r, it) } } } }
 
-    private fun setMode(m: Mode) {
+    private fun setMode(m: Mode, keepPosition: Boolean = false) {
         val r = root ?: return
         if (mode == m && r.childCount > 0) return
         mode = m
@@ -152,13 +157,19 @@ class OverlayController(private val ctx: Context) {
         r.removeAllViews()
         clearCardRefs()
         val params = lp ?: return
-        if (m == Mode.BUBBLE) {
-            r.addView(buildBubble())
+        if (m == Mode.CARD) {
+            r.addView(buildCard())
+            if (keepPosition) {
+                params.x = params.x.coerceIn(dp(4), maxOf(dp(4), screenW - cardW - dp(4)))
+                params.y = params.y.coerceIn(dp(24), screenH - dp(200))
+            } else {
+                placeCard(params)
+            }
+        } else {
+            r.addView(if (m == Mode.BALL) buildBall() else buildBubble())
             params.x = if (prefs.bubbleX in 0..(screenW - dp(52))) prefs.bubbleX else dp(8)
             params.y = if (prefs.bubbleY >= 0) prefs.bubbleY else dp(150)
-        } else {
-            r.addView(buildCard())
-            placeCard(params)
+            if (m == Mode.BALL) renderBall()
         }
         updateLayout()
     }
@@ -170,6 +181,7 @@ class OverlayController(private val ctx: Context) {
     }
 
     private fun clearCardRefs() {
+        ballView = null
         cardView = null; riskPill = null; headText = null; statusText = null; chevron = null
         bodyScroll = null; body = null; expanded = false; waitLabels.clear()
     }
@@ -186,6 +198,46 @@ class OverlayController(private val ctx: Context) {
         }
         attachDrag(b, widthPx = { dp(52) }, onTap = { showMenu(dp(56)) }) { x, y -> prefs.bubbleX = x; prefs.bubbleY = y }
         return b
+    }
+
+    /** The in-chat ball: tap to analyze / reopen the panel, long-press for the menu. */
+    private fun buildBall(): View {
+        val b = TextView(ctx).apply {
+            text = "Jev"; setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            alpha = 0.9f
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor("#3A7AFE")) }
+            layoutParams = FrameLayout.LayoutParams(dp(48), dp(48))
+        }
+        attachDrag(b, widthPx = { dp(48) }, onTap = { onBallTap() }) { x, y -> prefs.bubbleX = x; prefs.bubbleY = y }
+        ballView = b
+        return b
+    }
+
+    private fun onBallTap() {
+        when {
+            judgeWaiting || repliesWaiting -> toast("分析中，稍等")
+            judgment != null -> { setMode(Mode.CARD, keepPosition = true); setExpanded(true) }
+            else -> onManualAnalyze?.invoke()
+        }
+    }
+
+    private fun renderBall() {
+        val b = ballView ?: return
+        val lvl = judgment?.dangerLevel?.score?.roundToInt()
+        val color = when {
+            lvl != null -> dangerColor(lvl)
+            errorMsg != null -> Color.parseColor("#DC2626")
+            else -> Color.parseColor("#3A7AFE")
+        }
+        b.text = when {
+            judgeWaiting || repliesWaiting -> "…"
+            lvl != null -> "$lvl"
+            errorMsg != null -> "!"
+            else -> "Jev"
+        }
+        b.textSize = if (lvl != null) 16f else 12f
+        (b.background as? GradientDrawable)?.setColor(color)
     }
 
     // ------------------------------------------------------------------ card
@@ -227,19 +279,22 @@ class OverlayController(private val ctx: Context) {
     }
 
     private fun onHeaderTap() {
-        val nothingYet = judgment == null && replies.isNullOrEmpty() && !judgeWaiting
-        if (nothingYet || (judgment == null && errorMsg != null)) { onManualAnalyze?.invoke(); return }
-        setExpanded(!expanded)
+        if (expanded) setExpanded(false)
+        else onManualAnalyze?.invoke()
     }
 
+    /** Expand the panel; collapsing folds it back into the in-chat ball. */
     private fun setExpanded(v: Boolean) {
-        val s = bodyScroll ?: return
-        expanded = v
-        if (v) {
-            val y = lp?.y ?: dp(92)
-            s.maxH = minOf((screenH * 0.5f).roundToInt(), screenH - y - dp(140)).coerceAtLeast(dp(180))
+        if (!v) {
+            autoExpand = false
+            setMode(if (app != null) Mode.BALL else Mode.BUBBLE)
+            return
         }
-        s.visibility = if (v) View.VISIBLE else View.GONE
+        val s = bodyScroll ?: return
+        expanded = true
+        val y = lp?.y ?: dp(92)
+        s.maxH = minOf((screenH * 0.42f).roundToInt(), screenH - y - dp(140)).coerceAtLeast(dp(140))
+        s.visibility = View.VISIBLE
         render()
         updateLayout()
     }
@@ -295,6 +350,7 @@ class OverlayController(private val ctx: Context) {
             setPadding(dp(4), dp(4), dp(4), dp(4))
             layoutParams = FrameLayout.LayoutParams(dp(196), ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = top }
         }
+        if (app != null) menu.addView(menuItem("重新分析当前对话") { dismissMenu(); onManualAnalyze?.invoke() })
         menu.addView(menuItem("截屏识别一次") { dismissMenu(); onOcrCapture?.invoke() })
         menu.addView(menuItem("把当前会话存为联系人") { dismissMenu(); onSaveContact?.invoke() })
         menu.addView(menuItem("打开设置") { dismissMenu(); openSettings() })
@@ -330,33 +386,39 @@ class OverlayController(private val ctx: Context) {
 
     /**
      * [title] null = not inside a chat window: show the bubble. Otherwise show the
-     * card with whatever it already holds for this conversation (nothing is cleared
-     * here — that is [resetForNewConversation]'s job).
+     * in-chat ball, unless the result panel is already open — that stays put.
      */
     fun showIdle(title: String?) {
         if (!ensureWindow()) return
-        setMode(if (title == null) Mode.BUBBLE else Mode.CARD)
-        if (mode == Mode.CARD) render()
+        if (title == null) { setMode(Mode.BUBBLE); return }
+        if (mode == Mode.CARD) { render(); return }
+        setMode(Mode.BALL)
+        renderBall()
     }
 
     /** The conversation changed: drop everything that belonged to the previous one. */
     fun resetForNewConversation() {
         judgment = null; replies = null; replyError = null; errorMsg = null
-        judgeWaiting = false; repliesWaiting = false; stopTicker()
-        lastFill = null; noteText = null; ctxNotes = 0; ctxHistory = 0
-        if (expanded) setExpanded(false)
-        if (mode == Mode.CARD) render()
+        judgeWaiting = false; repliesWaiting = false; autoExpand = false; stopTicker()
+        noteText = null; ctxNotes = 0; ctxHistory = 0
+        when (mode) {
+            Mode.CARD -> setMode(if (app != null) Mode.BALL else Mode.BUBBLE)
+            Mode.BALL -> renderBall()
+            else -> Unit
+        }
     }
 
-    /** A new analysis round starts. The previous result stays on the card until the new one lands. */
+    /** A new analysis round starts. The previous result stays on the ball until the new one lands. */
     fun beginRound() {
         if (!ensureWindow()) return
-        setMode(Mode.CARD)
+        setMode(Mode.BALL)
+        autoExpand = true
         errorMsg = null; replyError = null
         judgeWaiting = true; repliesWaiting = true
         ctxNotes = 0; ctxHistory = 0
         startTicker()
         render()
+        renderBall()
     }
 
     /** "换一组" started: only the candidates are being redrafted. */
@@ -384,26 +446,33 @@ class OverlayController(private val ctx: Context) {
 
     fun showError(msg: String) {
         if (!ensureWindow()) return
-        setMode(Mode.CARD)
         errorMsg = msg
-        judgeWaiting = false; repliesWaiting = false; stopTicker()
-        render()
+        judgeWaiting = false; repliesWaiting = false; autoExpand = false
+        stopTicker()
+        setMode(Mode.CARD, keepPosition = true)
+        setExpanded(true)
     }
 
     fun showJudgment(a: Analysis) {
         judgment = a; errorMsg = null; judgeWaiting = false
         stopTickerIfIdle()
-        render(); flashIfCollapsed()
+        if (autoExpand && mode == Mode.BALL) {
+            autoExpand = false
+            setMode(Mode.CARD, keepPosition = true)
+            setExpanded(true)
+        } else {
+            render(); renderBall()
+        }
     }
 
     /** Replies land on their own — whether or not the judgment has arrived yet. */
-    fun showReplies(ranked: List<RankedReply>, error: String? = null, onFill: (String) -> Unit) {
-        lastFill = onFill
+    fun showReplies(ranked: List<RankedReply>, error: String? = null) {
         replies = ranked
         replyError = error
         repliesWaiting = false
         stopTickerIfIdle()
         render()
+        renderBall()
     }
 
     fun toast(msg: String) = Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
@@ -424,6 +493,7 @@ class OverlayController(private val ctx: Context) {
             val s = ((SystemClock.elapsedRealtime() - waitStart) / 1000).toInt()
             if (s >= UI_LIMIT_S) { giveUp(); return }
             statusText?.text = if (judgment == null && judgeWaiting) "${s}s" else "更新中 ${s}s"
+            if (mode == Mode.BALL) { ballView?.text = "${s}s"; ballView?.textSize = 12f }
             waitLabels.forEach { (tv, label) -> tv.text = "$label ${s}s" }
             main.postDelayed(this, 1000)
         }
@@ -445,13 +515,8 @@ class OverlayController(private val ctx: Context) {
         if (repliesWaiting) { repliesWaiting = false; if (replies.isNullOrEmpty()) replyError = "生成超时" }
         stopTicker()
         render()
-    }
-
-    private fun flashIfCollapsed() {
-        val c = cardView ?: return
-        if (expanded) return
-        c.background = card(16, panelBg(), stroke = true, strokeColor = Color.parseColor("#3A7AFE"), strokeW = 2)
-        main.postDelayed({ cardView?.background = card(16, panelBg(), stroke = true) }, 900)
+        renderBall()
+        if (judgment == null) showError(errorMsg ?: "分析超时，点这里重试")
     }
 
     // --------------------------------------------------------------- rendering
@@ -570,8 +635,6 @@ class OverlayController(private val ctx: Context) {
         })
         val btns = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
         btns.addView(pill("复制", false) { copy(text) })
-        // Fill, then fold the card so the input box + keyboard are visible to review/send.
-        btns.addView(pill("填入", true) { lastFill?.invoke(text); if (expanded) setExpanded(false) })
         c.addView(btns)
         return c
     }

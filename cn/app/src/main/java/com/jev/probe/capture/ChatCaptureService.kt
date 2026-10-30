@@ -4,7 +4,6 @@ import android.accessibilityservice.AccessibilityService
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Rect
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -245,7 +244,9 @@ open class ChatCaptureService : AccessibilityService() {
             .registerOnSharedPreferenceChangeListener(preferencesListener)
         overlay = OverlayController(this)
         overlay?.onManualAnalyze = {
-            currentSnapshot?.let { pendingSnapshot = it; runAnalysis() }
+            val snap = currentSnapshot
+            if (snap == null) overlay?.toast("还没读到聊天内容，稍等再点")
+            else { pendingSnapshot = snap; runAnalysis() }
         }
         overlay?.onRegenerate = { regenerateReplies() }
         // Bubble menu: file the open conversation as a knowledge-base contact.
@@ -478,7 +479,7 @@ open class ChatCaptureService : AccessibilityService() {
             }
             main.post {
                 regenerating = false
-                if (isCurrent(token)) overlay?.showReplies(ranked, replyError) { text -> fillInput(token, text) }
+                if (isCurrent(token)) overlay?.showReplies(ranked, replyError)
             }
         }
     }
@@ -591,7 +592,7 @@ open class ChatCaptureService : AccessibilityService() {
                     }
                     main.post {
                         if (isCurrent(token)) {
-                            overlay?.showReplies(ranked, replyError) { text -> fillInput(token, text) }
+                            overlay?.showReplies(ranked, replyError)
                         }
                         completed() // outside the guard: see the judge round
                     }
@@ -805,79 +806,6 @@ open class ChatCaptureService : AccessibilityService() {
             overlay?.setNote(snapshot.note)
             overlay?.showIdle(snapshot.title)
         }
-    }
-
-    /** Resolve only the originating chat's input, never an arbitrary foreground editor. */
-    private fun inputFor(token: ConversationSession.Token): AccessibilityNodeInfo? {
-        if (!isCurrent(token)) return null
-        val root = rootInActiveWindow ?: return null
-        if (targetFor(root) != token.target) return null
-        val input = when (token.target.pkg) {
-            "com.tencent.mobileqq" -> root.findAccessibilityNodeInfosByViewId("com.tencent.mobileqq:id/input").firstOrNull()
-            "com.ss.android.lark" -> root.findAccessibilityNodeInfosByViewId("com.ss.android.lark:id/kb_rich_text_content").firstOrNull()
-            "com.twitter.android" -> findEditable(root)
-            else -> null // Unknown apps support explicit clipboard copy, not unverified writes.
-        }
-        // Re-read the node after SET_TEXT: the accessibility cache may still
-        // contain the previous draft even though the write already succeeded.
-        input ?: return null
-        if (!input.refresh()) return null
-        return input.takeIf { it.isVisibleToUser && it.isEnabled && !it.isPassword }
-    }
-
-    /** Fill without blocking the main thread; all retries re-resolve the original target. */
-    private fun fillInput(token: ConversationSession.Token, text: String) {
-        fun finish(ok: Boolean) {
-            if (!isCurrent(token)) return
-            if (ok) overlay?.toast("已填入，确认后自己发送")
-            else { copyToClipboard(text); overlay?.toast("已复制，长按输入框粘贴") }
-        }
-        if (!isCurrent(token)) { overlay?.toast("会话已变化，请重新分析后填入"); return }
-        if (inputFor(token) == null) { finish(false); return }
-        GuardedInputWriter(
-            resolve = {
-                inputFor(token)?.let { node ->
-                    object : GuardedInputWriter.Input {
-                        override val text: String? get() = node.text?.toString()
-                        override fun setText(text: String) = setTextRaw(node, text)
-                        override fun focus() { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
-                        override fun paste() { node.performAction(AccessibilityNodeInfo.ACTION_PASTE) }
-                    }
-                }
-            },
-            later = { delay, action -> main.postDelayed({ action() }, delay) },
-            copy = { copyToClipboard(it) },
-            complete = { finish(it) }
-        ).fill(text)
-    }
-
-    private fun setTextRaw(edit: AccessibilityNodeInfo, text: String): Boolean {
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-        }
-        return edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-    }
-
-    private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.addLast(root)
-        var guard = 0
-        var found: AccessibilityNodeInfo? = null
-        while (stack.isNotEmpty() && guard < 5000) {
-            guard++
-            val node = stack.removeLast()
-            if (node.isEditable && node.isVisibleToUser && node.isEnabled && !node.isPassword) {
-                if (found != null) return null // Ambiguous editor: clipboard only.
-                found = node
-            }
-            for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
-        }
-        return if (stack.isEmpty()) found else null
-    }
-
-    private fun copyToClipboard(text: String) {
-        val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        cm.setPrimaryClip(android.content.ClipData.newPlainText("jev_reply", text))
     }
 
     override fun onInterrupt() {

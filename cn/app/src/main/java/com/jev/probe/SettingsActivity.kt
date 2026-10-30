@@ -318,7 +318,7 @@ class SettingsActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE; minLines = 2
         }
         card2.addView(wlEdit)
-        val autoRow = toggleRow("对方发消息时自动分析", prefs.autoAnalyze)
+        val autoRow = toggleRow("对方发消息时自动分析（关闭=点悬浮球才分析）", prefs.autoAnalyze)
         card2.addView(autoRow)
         card2.addView(label("候选回复条数"))
         var pickedCount = prefs.candidateCount
